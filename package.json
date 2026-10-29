@@ -1,0 +1,27 @@
+{
+  "name": "tizenbrew-ecran-accueil",
+  "appName": "Écran d'accueil",
+  "version": "0.1.0",
+  "description": "Ouvre un écran d'accueil hébergé sur ton réseau local et lui permet de lancer les applis de la TV et les modules TizenBrew.",
+  "packageType": "app",
+  "appPath": "app/index.html",
+  "serviceFile": "service/service.js",
+  "keys": [
+    "MediaPlayPause",
+    "MediaPlay",
+    "MediaPause",
+    "MediaStop",
+    "MediaFastForward",
+    "MediaRewind",
+    "MediaTrackNext",
+    "MediaTrackPrevious"
+  ],
+  "files": [
+    "app/",
+    "service/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\""
+  }
+}

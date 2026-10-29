@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<!-- Le service reconnaît la page à son adresse complète (en-tête Referer) : on l'envoie
+     explicitement, quelle que soit la règle par défaut du navigateur. -->
+<meta name="referrer" content="no-referrer-when-downgrade">
+<title>Écran d'accueil</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body { color: #f5f5f7; font-family: "SamsungOneUI", "SamsungOne", "Tizen", "Helvetica Neue", Arial, sans-serif; }
+  .plan { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; overflow: hidden; -webkit-transform-origin: 0 0; transform-origin: 0 0; }
+  #ecran { z-index: 1; }
+  #chargeur { z-index: 2; background: #000; }
+  .boite { position: absolute; left: 300px; top: 260px; width: 1320px; }
+  h1 { margin: 0 0 28px 0; font-size: 60px; font-weight: 600; }
+  p { margin: 0 0 22px 0; font-size: 32px; line-height: 1.4; color: #d1d1d6; }
+  .etape { color: #8e8e93; }
+  .aide { position: absolute; left: 300px; top: 900px; width: 1320px; font-size: 26px; color: #636366; }
+  .alerte { color: #ff9f0a; }
+  #saisie { display: block; width: 1220px; height: 76px; margin: 8px 0 18px 0; padding: 0 24px; font-size: 38px; color: #fff; background: #1c1c1e; border: 3px solid #48484a; border-radius: 14px; outline: none; }
+  #saisie.focus { border-color: #f5f5f7; }
+  .btn { display: inline-block; margin: 18px 22px 0 0; padding: 16px 34px; font-size: 30px; color: #f5f5f7; background: #2c2c2e; border-radius: 40px; }
+  .btn.focus { color: #000; background: #f5f5f7; }
+  #avis { position: absolute; left: 300px; top: 940px; width: 1264px; z-index: 3; padding: 20px 28px; font-size: 28px; line-height: 1.35; color: #f5f5f7; background: #1c1c1e; border-radius: 18px; }
+  /* En dernier : l'emporte sur .btn, de même poids. */
+  .cache { display: none; }
+</style>
+</head>
+<body>
+<div id="ecran" class="plan"></div>
+<div id="chargeur" class="plan">
+  <div id="attente" class="boite">
+    <h1>Écran d'accueil</h1>
+    <p id="etape-service" class="etape">Démarrage du service du module…</p>
+    <p id="etape-ecran" class="etape"></p>
+  </div>
+  <div id="reglage" class="boite cache">
+    <h1>Adresse de l'écran</h1>
+    <p>Saisis l'adresse de ton écran sur le réseau local, par exemple <b>192.168.1.20:8080/ecran</b> (OK sur le champ ouvre le clavier). Elle reste enregistrée sur cette TV.</p>
+    <input id="saisie" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <p id="reglage-message" class="alerte"></p>
+    <div><span id="btn-enregistrer" class="btn">Essayer et enregistrer</span><span id="btn-annuler" class="btn">Annuler</span><span id="btn-quitter-reglage" class="btn">Revenir à TizenBrew</span></div>
+  </div>
+  <div id="erreur" class="boite cache">
+    <h1>L'écran ne s'affiche pas</h1>
+    <p id="erreur-texte" class="alerte"></p>
+    <div><span id="btn-reessayer" class="btn">Réessayer</span><span id="btn-adresse" class="btn">Changer l'adresse</span><span id="btn-quitter-erreur" class="btn">Revenir à TizenBrew</span></div>
+  </div>
+  <p id="aide" class="aide">Haut : changer l'adresse de l'écran. Retour : revenir à TizenBrew.</p>
+</div>
+<div id="avis" class="cache"></div>
+<script>
+/*
+ * Chargeur du module « Écran d'accueil ».
+ *
+ * La page de ce module ne contient pas l'écran : elle va le chercher sur le réseau local
+ * (fichier ecran.js à l'adresse saisie une fois sur la TV) et lui donne de quoi
+ * lister et lancer les applis de la TV (par le service du module) et ouvrir un module
+ * TizenBrew (par le canal interne de TizenBrew). L'écran tourne dans cette page.
+ *
+ * Contrat avec l'écran : ecran.js appelle Chargeur.declarer({ nom, version, demarrer }),
+ * puis le chargeur appelle demarrer(api) ; l'écran appelle api.pret() une fois affiché.
+ */
+(function () {
+  'use strict';
+
+  var VERSION = '0.1.0';
+  var MODULE = 'ecran-accueil';
+  var CLE = 'ecran-accueil.adresse';
+  var DELAI_ECRAN = 15000;
+  var DELAI_PRET = 20000;
+
+  var params = lireParametres();
+  var SERVICE = params.service || 'http://127.0.0.1:8097';
+  var TIZENBREW = params.tizenbrew || 'ws://127.0.0.1:8081';
+
+  var navigationStart = (window.performance && performance.timing && performance.timing.navigationStart) || Date.now();
+  var readyAt = Date.now();
+  // Suffixe anti-cache : une copie sur le NAS compte dès le lancement suivant.
+  var chargement = String(readyAt);
+
+  var mode = 'attente';
+  var st = {
+    essais: 0, session: null, sessionAt: null, jeton: null,
+    adresse: null, ecran: null, ecranAt: null, lance: false, pretAt: null,
+    minuteriePret: null, avertissements: []
+  };
+  var chargements = [];
+  var focus = { liste: [], index: 0 };
+  var minuterieAvis = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  function lireParametres() {
+    var resultat = {};
+    var morceaux = location.search.replace(/^\?/, '').split('&');
+    for (var i = 0; i < morceaux.length; i++) {
+      var paire = morceaux[i].split('=');
+      var cle;
+      var valeur;
+      try {
+        cle = decodeURIComponent(paire[0] || '');
+        valeur = decodeURIComponent(paire.slice(1).join('=') || '');
+      } catch (e) {
+        continue;
+      }
+      // Pour les tests seulement, et toujours vers la TV elle-même.
+      if (cle === 'service' && /^http:\/\/127\.0\.0\.1:\d+$/.test(valeur)) { resultat.service = valeur; }
+      if (cle === 'tizenbrew' && /^ws:\/\/127\.0\.0\.1:\d+$/.test(valeur)) { resultat.tizenbrew = valeur; }
+    }
+    return resultat;
+  }
+
+  function secondes(ms) {
+    return (ms / 1000).toFixed(1).replace('.', ',') + ' s';
+  }
+
+  // La page est dessinée en 1920 × 1080 ; certaines TV donnent d'abord une surface plus petite.
+  function ajuster() {
+    var echelle = Math.min((window.innerWidth || 1920) / 1920, (window.innerHeight || 1080) / 1080);
+    var valeur = echelle === 1 ? '' : 'scale(' + echelle + ')';
+    var plans = document.querySelectorAll('.plan');
+    for (var i = 0; i < plans.length; i++) {
+      plans[i].style.webkitTransform = valeur;
+      plans[i].style.transform = valeur;
+    }
+  }
+
+  /* ---------- Adresse de l'écran ---------- */
+
+  function estLocal(hote) {
+    var m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(hote);
+    if (m) {
+      var a = Number(m[1]);
+      var b = Number(m[2]);
+      return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+    }
+    if (hote === 'localhost') { return true; }
+    // Nom court du réseau local (« nas ») ou domaine réservé aux réseaux locaux.
+    if (hote.indexOf('.') === -1) { return /^[a-z0-9-]+$/.test(hote); }
+    return /\.(local|lan|home|internal|home\.arpa)$/.test(hote);
+  }
+
+  function normaliser(saisie) {
+    var texte = String(saisie || '').replace(/\s+/g, '');
+    if (!texte) { return { raison: 'Saisis une adresse.' }; }
+    if (!/^https?:\/\//i.test(texte)) { texte = 'http://' + texte; }
+    var lien = document.createElement('a');
+    lien.href = texte;
+    var hote = String(lien.hostname || '').toLowerCase();
+    if (!/^https?:$/.test(lien.protocol) || !hote) { return { raison: 'Adresse illisible : ' + saisie + '.' }; }
+    if (!estLocal(hote)) { return { raison: 'Seules les adresses du réseau local sont acceptées (par exemple 192.168.x.x).' }; }
+    var chemin = (lien.pathname || '/').replace(/ecran\.js$/, '');
+    if (chemin.charAt(chemin.length - 1) !== '/') { chemin += '/'; }
+    return { adresse: lien.protocol + '//' + lien.host + chemin };
+  }
+
+  function lireAdresse() {
+    try {
+      var adresse = localStorage.getItem(CLE);
+      return adresse ? normaliser(adresse).adresse || null : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /* ---------- Service du module ---------- */
+
+  function requete(methode, chemin, corps, fini, sansJeton) {
+    var xhr = new XMLHttpRequest();
+    var fait = false;
+    function finir(err, data, statut) {
+      if (fait) { return; }
+      fait = true;
+      fini(err, data, statut);
+    }
+    try {
+      xhr.open(methode, SERVICE + chemin, true);
+      xhr.timeout = 25000;
+      if (!sansJeton) { xhr.setRequestHeader('X-Ecran-Jeton', st.jeton || ''); }
+      if (corps) { xhr.setRequestHeader('Content-Type', 'application/json'); }
+    } catch (e) {
+      return finir('Service du module injoignable (' + SERVICE + ').', null, 0);
+    }
+    xhr.onload = function () {
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+      if (xhr.status >= 200 && xhr.status < 300 && data) { return finir(null, data, xhr.status); }
+      finir((data && data.error) || 'Réponse ' + xhr.status + ' du service du module.', data, xhr.status);
+    };
+    xhr.onerror = function () { finir('Service du module injoignable (' + SERVICE + ').', null, 0); };
+    xhr.ontimeout = function () { finir('Le service du module ne répond pas.', null, 0); };
+    xhr.send(corps ? JSON.stringify(corps) : null);
+  }
+
+  // TizenBrew ouvre la page et télécharge le service en même temps : on réessaie.
+  function connecterService() {
+    st.essais += 1;
+    var chemin = '/session?nav=' + navigationStart + '&ready=' + readyAt + '&tries=' + st.essais + '&waited=' + (Date.now() - readyAt);
+    requete('GET', chemin, null, function (err, data, statut) {
+      if (err && statut) { return montrerErreur(err + ' Relance le module depuis TizenBrew ; si ça continue, redémarre la TV.'); }
+      if (err) {
+        afficherAttente();
+        return setTimeout(connecterService, st.essais < 10 ? 1000 : 2000);
+      }
+      if (data.module !== MODULE) {
+        return montrerErreur('Le port du service (' + SERVICE + ') répond pour un autre module (' + (data.module || 'inconnu') + '). Redémarre la TV, puis rouvre ce module.');
+      }
+      st.jeton = data.token;
+      st.session = {};
+      for (var cle in data) {
+        if (data.hasOwnProperty(cle) && cle !== 'token') { st.session[cle] = data[cle]; }
+      }
+      st.sessionAt = Date.now();
+      if (data.version !== VERSION) {
+        st.avertissements.push('Service du module en version ' + data.version + ', page en ' + VERSION + ' : redémarre la TV pour finir la mise à jour.');
+      }
+      afficherAttente();
+      lancerSiPret();
+    }, true);
+  }
+
+  /* ---------- Canal interne de TizenBrew (ws://127.0.0.1:8081) ---------- */
+
+  var EV_GET_MODULES = 4;
+  var EV_LAUNCH_MODULE = 5;
+
+  function listerModules(fini) {
+    var fait = false;
+    var socket;
+    var minuterie = setTimeout(function () { finir('TizenBrew ne donne pas la liste de ses modules.'); }, 10000);
+    function finir(err, liste) {
+      if (fait) { return; }
+      fait = true;
+      clearTimeout(minuterie);
+      try { socket.close(); } catch (e) { /* déjà fermé */ }
+      fini(err, liste);
+    }
+    try { socket = new WebSocket(TIZENBREW); } catch (e) { return finir('Canal de TizenBrew injoignable (' + TIZENBREW + ').'); }
+    socket.onopen = function () { socket.send(JSON.stringify({ type: EV_GET_MODULES })); };
+    socket.onmessage = function (event) {
+      var msg = null;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+      if (!msg || msg.type !== EV_GET_MODULES) { return; }
+      // TizenBrew répond null tant qu'il n'a pas relu tous ses modules.
+      if (msg.payload === null) {
+        return setTimeout(function () { if (!fait) { socket.send(JSON.stringify({ type: EV_GET_MODULES })); } }, 500);
+      }
+      finir(null, msg.payload || []);
+    };
+    socket.onerror = function () { finir('Canal de TizenBrew injoignable (' + TIZENBREW + ').'); };
+  }
+
+  function trouverModule(liste, nom) {
+    var bas = String(nom).toLowerCase();
+    for (var i = 0; i < liste.length; i++) {
+      var m = liste[i] || {};
+      if (m.fullName === nom || m.name === nom || String(m.appName || '').toLowerCase() === bas) { return m; }
+    }
+    return null;
+  }
+
+  // Comme le menu de TizenBrew : « LaunchModule » (démarre son service, prépare l'injection
+  // d'un module de type mods), puis la page part vers l'adresse du module.
+  function ouvrirModule(nom, fini) {
+    listerModules(function (err, liste) {
+      if (err) { return fini(err); }
+      var mod = trouverModule(liste, nom);
+      if (!mod) { return fini('Module « ' + nom + ' » absent de TizenBrew.'); }
+      if (!mod.appPath) { return fini('Module « ' + nom + ' » sans page à ouvrir.'); }
+      var fait = false;
+      var socket;
+      var minuterie = setTimeout(function () { finir('TizenBrew ne répond pas.'); }, 5000);
+      function finir(erreur) {
+        if (fait) { return; }
+        fait = true;
+        clearTimeout(minuterie);
+        fini(erreur || null, mod);
+        if (!erreur) { location.href = mod.appPath; }
+      }
+      try { socket = new WebSocket(TIZENBREW); } catch (e) { return finir('Canal de TizenBrew injoignable (' + TIZENBREW + ').'); }
+      socket.onopen = function () {
+        socket.send(JSON.stringify({ type: EV_LAUNCH_MODULE, payload: mod }));
+        var debut = Date.now();
+        (function attendre() {
+          if (socket.bufferedAmount === 0 || Date.now() - debut > 500) { return finir(null); }
+          setTimeout(attendre, 20);
+        })();
+      };
+      socket.onerror = function () { finir('Canal de TizenBrew injoignable (' + TIZENBREW + ').'); };
+    });
+  }
+
+  /* ---------- Chargement de l'écran ---------- */
+
+  function declarer(ecran) {
+    var script = document.currentScript;
+    for (var i = 0; i < chargements.length; i++) {
+      if (chargements[i].script === script && !chargements[i].ecran && ecran && typeof ecran.demarrer === 'function') {
+        chargements[i].ecran = ecran;
+      }
+    }
+  }
+
+  function chargerEcran(adresse, fini) {
+    var slot = { script: document.createElement('script'), ecran: null };
+    var fait = false;
+    var minuterie = setTimeout(function () { finir('Le NAS ne répond pas à l\'adresse ' + adresse + ' (' + DELAI_ECRAN / 1000 + ' s).'); }, DELAI_ECRAN);
+    function finir(err) {
+      if (fait) { return; }
+      fait = true;
+      clearTimeout(minuterie);
+      chargements.splice(chargements.indexOf(slot), 1);
+      fini(err, slot.ecran);
+    }
+    slot.script.onload = function () {
+      if (slot.ecran) { return finir(null); }
+      finir('Le fichier ecran.js trouvé à l\'adresse ' + adresse + ' ne déclare pas d\'écran.');
+    };
+    slot.script.onerror = function () { finir('Aucun écran à l\'adresse ' + adresse + ', ou NAS injoignable.'); };
+    chargements.push(slot);
+    slot.script.src = adresse + 'ecran.js?v=' + chargement;
+    document.head.appendChild(slot.script);
+  }
+
+  function lancerSiPret() {
+    if (st.lance || !st.session || !st.ecran || mode !== 'attente') { return; }
+    st.lance = true;
+    $('etape-ecran').textContent = 'Ouverture de l\'écran…';
+    api.adresse = st.adresse;
+    api.session = st.session;
+    api.depart = { navigation: navigationStart, page: readyAt, service: st.sessionAt, ecran: st.ecranAt, pret: null };
+    st.minuteriePret = setTimeout(function () {
+      if (!st.pretAt) { montrerErreur('L\'écran chargé depuis ' + st.adresse + ' ne s\'est pas affiché en ' + DELAI_PRET / 1000 + ' s.'); }
+    }, DELAI_PRET);
+    try {
+      st.ecran.demarrer(api);
+    } catch (e) {
+      montrerErreur('L\'écran a planté au démarrage : ' + (e && e.message ? e.message : e) + '.');
+    }
+  }
+
+  var api = {
+    version: VERSION,
+    racine: $('ecran'),
+    adresse: null,
+    session: null,
+    depart: null,
+    // Adresse d'un fichier de l'écran, sans cache.
+    fichier: function (chemin) { return st.adresse + chemin + (chemin.indexOf('?') === -1 ? '?' : '&') + 'v=' + chargement; },
+    applis: function (recharger, fini) { requete('GET', '/applis' + (recharger ? '?recharger=1' : ''), null, fini); },
+    lancer: function (id, fini) {
+      requete('POST', '/lancer', { id: id }, function (err, data) {
+        if (err) { return fini(err, data); }
+        if (!data.ok) { return fini(data.error || 'La TV a refusé le lancement.', data); }
+        fini(null, data);
+      });
+    },
+    icone: function (id) { return SERVICE + '/icone?id=' + encodeURIComponent(id); },
+    etat: function (fini) { requete('GET', '/etat', null, fini); },
+    modules: function (fini) { listerModules(fini); },
+    ouvrirModule: function (nom, fini) { ouvrirModule(nom, fini || function () {}); },
+    pret: function () {
+      if (st.pretAt) { return; }
+      st.pretAt = Date.now();
+      api.depart.pret = st.pretAt;
+      clearTimeout(st.minuteriePret);
+      if (mode === 'attente') { montrerEcran(); }
+      for (var i = 0; i < st.avertissements.length; i++) { avis(st.avertissements[i]); }
+    },
+    erreur: function (texte) { montrerErreur(texte); },
+    avis: function (texte) { avis(texte); },
+    changerAdresse: function () { ouvrirReglage(); },
+    recharger: function () { location.reload(); },
+    retour: function () { history.back(); }
+  };
+
+  /* ---------- Affichage du chargeur ---------- */
+
+  function montrer(id) {
+    var boites = ['attente', 'reglage', 'erreur'];
+    for (var i = 0; i < boites.length; i++) { $(boites[i]).className = boites[i] === id ? 'boite' : 'boite cache'; }
+    $('chargeur').className = 'plan';
+    $('aide').className = id === 'attente' ? 'aide' : 'aide cache';
+  }
+
+  function afficherAttente() {
+    if (mode !== 'attente') { return; }
+    var attente = Date.now() - readyAt;
+    var service;
+    if (st.session) {
+      service = 'Service du module : prêt.';
+    } else if (attente > 30000) {
+      service = 'Le service du module ne répond toujours pas (' + secondes(attente) + '). Vérifie la connexion Internet de la TV : TizenBrew télécharge le module à chaque ouverture.';
+    } else {
+      service = st.essais > 1 ? 'Attente du service du module : ' + secondes(attente) + ', ' + st.essais + ' essais…' : 'Démarrage du service du module…';
+    }
+    $('etape-service').textContent = service;
+    if (!st.lance) { $('etape-ecran').textContent = st.ecran ? 'Écran : chargé.' : (st.adresse ? 'Chargement de l\'écran depuis ' + st.adresse + '…' : ''); }
+  }
+
+  function montrerEcran() {
+    mode = 'ecran';
+    $('chargeur').className = 'plan cache';
+  }
+
+  function montrerErreur(texte) {
+    mode = 'erreur';
+    $('erreur-texte').textContent = texte;
+    montrer('erreur');
+    definirFocus([$('btn-reessayer'), $('btn-adresse'), $('btn-quitter-erreur')], 0);
+  }
+
+  function ouvrirReglage() {
+    mode = 'reglage';
+    $('saisie').value = st.adresse || '';
+    $('reglage-message').textContent = '';
+    var annulable = !!(st.pretAt || st.adresse);
+    $('btn-annuler').className = annulable ? 'btn' : 'btn cache';
+    montrer('reglage');
+    var liste = [$('saisie'), $('btn-enregistrer')];
+    if (annulable) { liste.push($('btn-annuler')); }
+    liste.push($('btn-quitter-reglage'));
+    definirFocus(liste, 0);
+  }
+
+  function annulerReglage() {
+    if (st.pretAt) { return montrerEcran(); }
+    if (st.adresse) {
+      mode = 'attente';
+      montrer('attente');
+      afficherAttente();
+      return lancerSiPret();
+    }
+  }
+
+  function enregistrer() {
+    var resultat = normaliser($('saisie').value);
+    if (!resultat.adresse) { $('reglage-message').textContent = resultat.raison; return; }
+    $('reglage-message').textContent = 'Recherche de l\'écran à ' + resultat.adresse + '…';
+    chargerEcran(resultat.adresse, function (err) {
+      if (err) { $('reglage-message').textContent = err; return; }
+      try {
+        localStorage.setItem(CLE, resultat.adresse);
+      } catch (e) {
+        $('reglage-message').textContent = 'Écran trouvé, mais la TV refuse d\'enregistrer l\'adresse (' + e.message + ').';
+        return;
+      }
+      location.reload();
+    });
+  }
+
+  function avis(texte) {
+    var boite = $('avis');
+    boite.textContent = texte;
+    boite.className = '';
+    clearTimeout(minuterieAvis);
+    minuterieAvis = setTimeout(function () { boite.className = 'cache'; }, 8000);
+  }
+
+  /* ---------- Télécommande, hors de l'écran ---------- */
+
+  var actions = {
+    'btn-enregistrer': enregistrer,
+    'btn-annuler': annulerReglage,
+    'btn-quitter-reglage': function () { history.back(); },
+    'btn-reessayer': function () { location.reload(); },
+    'btn-adresse': ouvrirReglage,
+    'btn-quitter-erreur': function () { history.back(); }
+  };
+
+  function definirFocus(liste, index) {
+    focus.liste = liste;
+    focus.index = index;
+    peindreFocus();
+  }
+
+  function peindreFocus() {
+    var anciens = document.querySelectorAll('#chargeur .focus');
+    for (var i = 0; i < anciens.length; i++) { anciens[i].classList.remove('focus'); }
+    if (focus.liste[focus.index]) { focus.liste[focus.index].classList.add('focus'); }
+  }
+
+  function deplacer(pas) {
+    focus.index = Math.max(0, Math.min(focus.liste.length - 1, focus.index + pas));
+    peindreFocus();
+  }
+
+  function activer() {
+    var element = focus.liste[focus.index];
+    if (!element) { return; }
+    if (element.id === 'saisie') { return element.focus(); }
+    if (actions[element.id]) { actions[element.id](); }
+  }
+
+  // Écouteur posé en phase de capture : tant que l'écran n'est pas affiché, il garde les touches.
+  window.addEventListener('keydown', function (e) {
+    if (mode === 'ecran') { return; }
+    e.stopImmediatePropagation();
+    var code = e.keyCode;
+    var saisie = $('saisie');
+    if (document.activeElement === saisie) {
+      // 65376 et 65385 : « Terminé » et « Annuler » du clavier à l'écran de la TV.
+      if (code === 13 || code === 65376) {
+        e.preventDefault();
+        saisie.blur();
+        return deplacer(1);
+      }
+      if (code === 65385 || code === 27) { return saisie.blur(); }
+      if (code !== 38 && code !== 40 && code !== 10009) { return; }
+      saisie.blur();
+    }
+    if (code === 10009) {
+      e.preventDefault();
+      if (mode === 'reglage' && (st.pretAt || st.adresse)) { return annulerReglage(); }
+      return history.back();
+    }
+    if (mode === 'attente') {
+      if (code === 38) {
+        e.preventDefault();
+        ouvrirReglage();
+      }
+      return;
+    }
+    if (code === 37 || code === 38) {
+      e.preventDefault();
+      deplacer(-1);
+    } else if (code === 39 || code === 40) {
+      e.preventDefault();
+      deplacer(1);
+    } else if (code === 13) {
+      e.preventDefault();
+      activer();
+    }
+  }, true);
+
+  /* ---------- Démarrage ---------- */
+
+  ajuster();
+  window.addEventListener('resize', ajuster);
+  var reajustements = 0;
+  var minuterieAjuster = setInterval(function () {
+    ajuster();
+    reajustements += 1;
+    if (reajustements >= 6) { clearInterval(minuterieAjuster); }
+  }, 500);
+
+  window.Chargeur = { version: VERSION, declarer: declarer };
+
+  connecterService();
+  st.adresse = lireAdresse();
+  if (!st.adresse) {
+    ouvrirReglage();
+  } else {
+    afficherAttente();
+    chargerEcran(st.adresse, function (err, ecran) {
+      if (err) { return montrerErreur(err); }
+      st.ecran = ecran;
+      st.ecranAt = Date.now();
+      afficherAttente();
+      lancerSiPret();
+    });
+  }
+  var minuterieAttente = setInterval(function () {
+    if (st.pretAt) { return clearInterval(minuterieAttente); }
+    afficherAttente();
+  }, 1000);
+})();
+</script>
+</body>
+</html>
